@@ -10,7 +10,7 @@ import pandas as pd
 from tqdm import tqdm
 
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, BitsAndBytesConfig
 
 from be_great.great_dataset import GReaTDataset, GReaTDataCollator
 from be_great.great_start import (
@@ -30,6 +30,13 @@ from be_great.great_utils import (
     bcolors,
 )
 
+from peft import (
+    LoraConfig,
+    AutoPeftModelForCausalLM,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    TaskType,
+)
 
 class GReaT:
     """GReaT Class
@@ -59,7 +66,9 @@ class GReaT:
         experiment_dir: str = "trainer_great",
         epochs: int = 100,
         batch_size: int = 8,
+        quantization_config: BitsAndBytesConfig = None,
         efficient_finetuning: str = "",
+        lora_config: LoraConfig = None,
         **train_kwargs,
     ):
         """Initializes GReaT.
@@ -69,47 +78,55 @@ class GReaT:
             experiment_dir:  Directory, where the training checkpoints will be saved
             epochs: Number of epochs to fine-tune the model
             batch_size: Batch size used for fine-tuning
+            quantization_config: (Optional) BitsAndBytesConfig object for model quantization
             efficient_finetuning: Indication of fune-tuning method
+            lora_config: (Optional) LoraConfig object for configuration of Lora - applicable when "lora" is selected as efficient_finetuning method
             train_kwargs: Additional hyperparameters added to the TrainingArguments used by the HuggingFaceLibrary,
              see here the full list of all possible values
              https://huggingface.co/docs/transformers/main/en/main_classes/trainer#transformers.TrainingArguments
         """
-        # Load Model and Tokenizer from HuggingFace
         self.efficient_finetuning = efficient_finetuning
+        self.quantization_config = quantization_config
+        self.lora_config = lora_config
+
+        # Load Model and Tokenizer from HuggingFace
         self.llm = llm
         self.tokenizer = AutoTokenizer.from_pretrained(self.llm)
         self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(self.llm)
+        self.tokenizer.padding_side = "left"
+        if self.quantization_config is None:
+            self.model = AutoModelForCausalLM.from_pretrained(self.llm)
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                self.llm, 
+                quantization_config=quantization_config,
+                low_cpu_mem_usage=True
+            )
 
         if self.efficient_finetuning == "lora":
-            # Lazy importing
-            try:
-                from peft import (
-                    LoraConfig,
-                    get_peft_model,
-                    prepare_model_for_int8_training,
-                    TaskType,
-                )
-            except ImportError:
-                raise ImportError(
-                    "This function requires the 'peft' package. Please install it with - pip install peft"
-                )
 
             # Define LoRA Config
-            lora_config = LoraConfig(
-                r=16,  # only training 0.16% of the parameters of the model
-                lora_alpha=32,
-                target_modules=[
-                    "c_attn"
-                ],  # this is specific for gpt2 model, to be adapted
-                lora_dropout=0.05,
-                bias="none",
-                task_type=TaskType.CAUSAL_LM,  # this is specific for gpt2 model, to be adapted
-            )
+            if self.lora_config is None:
+                self.lora_config = LoraConfig(
+                    r=16,  # only training 0.16% of the parameters of the model
+                    lora_alpha=32,
+                    target_modules=[
+                        "c_attn"
+                    ],  # this is specific for gpt2 model, to be adapted
+                    lora_dropout=0.05,
+                    bias="none",
+                    task_type=TaskType.CAUSAL_LM,  # this is specific for gpt2 model, to be adapted
+                )
             # prepare int-8 model for training
-            self.model = prepare_model_for_int8_training(self.model)
+            self.model.config.use_cache = False # for compatibility with gradient checkpointing
+            self.model.config.pretraining_tp = 1
+            self.model = prepare_model_for_kbit_training(
+                self.model,
+                use_gradient_checkpointing=True,
+                gradient_checkpointing_kwargs={"use_reentrant": True}
+            )
             # add LoRA adaptor
-            self.model = get_peft_model(self.model, lora_config)
+            self.model = get_peft_model(self.model, self.lora_config)
             self.model.print_trainable_parameters()
 
         # Set the training hyperparameters
@@ -123,6 +140,8 @@ class GReaT:
         self.num_cols = None
         self.conditional_col = None
         self.conditional_col_dist = None
+
+        self.trainer = None
 
     def fit(
         self,
@@ -162,7 +181,7 @@ class GReaT:
             per_device_train_batch_size=self.batch_size,
             **self.train_hyperparameters,
         )
-        great_trainer = GReaTTrainer(
+        self.trainer = GReaTTrainer(
             self.model,
             training_args,
             train_dataset=great_ds,
@@ -172,8 +191,8 @@ class GReaT:
 
         # Start training
         logging.info("Start training...")
-        great_trainer.train(resume_from_checkpoint=resume_from_checkpoint)
-        return great_trainer
+        self.trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        return self.trainer
 
     def sample(
         self,
@@ -210,7 +229,10 @@ class GReaT:
         great_start = self._get_start_sampler(start_col, start_col_dist)
 
         # Move model to device
-        self.model.to(device)
+        #self.model.to(device)
+
+        # Switch to eval mode
+        self.model.eval()
 
         # Init list for generated DataFrames
         dfs = []
@@ -223,15 +245,16 @@ class GReaT:
                 while n_samples > already_generated:
                     start_tokens = great_start.get_start_tokens(k)
                     start_tokens = torch.tensor(start_tokens).to(device)
-
-                    # Generate tokens
-                    tokens = self.model.generate(
-                        input_ids=start_tokens,
-                        max_length=max_length,
-                        do_sample=True,
-                        temperature=temperature,
-                        pad_token_id=50256,
-                    )
+                    
+                    with torch.inference_mode():
+                        # Generate tokens
+                        tokens = self.model.generate(
+                            input_ids=start_tokens,
+                            max_length=max_length,
+                            do_sample=True,
+                            temperature=temperature,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                        )
 
                     # Convert tokens back to tabular data
                     text_data = _convert_tokens_to_text(tokens, self.tokenizer)
@@ -311,7 +334,7 @@ class GReaT:
         """
         # ToDo: Add n_samples argument to generate more samples for one conditional input.
 
-        self.model.to(device)
+        #self.model.to(device)
         starting_prompts = (
             [starting_prompts]
             if isinstance(starting_prompts, str)
@@ -326,16 +349,17 @@ class GReaT:
             loop_iter = starting_prompts
         for prompt in loop_iter:
             start_token = torch.tensor(self.tokenizer(prompt)["input_ids"]).to(device)
-
-            # Generate tokens
-            gen = self.model.generate(
-                input_ids=torch.unsqueeze(start_token, 0),
-                max_length=max_length,
-                do_sample=True,
-                temperature=temperature,
-                pad_token_id=50256,
-            )
-            generated_data.append(torch.squeeze(gen))
+            
+            with torch.inference_mode():
+                # Generate tokens
+                gen = self.model.generate(
+                    input_ids=torch.unsqueeze(start_token, 0),
+                    max_length=max_length,
+                    do_sample=True,
+                    temperature=temperature,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                generated_data.append(torch.squeeze(gen))
 
         # Convert Text back to Tabular Data
         decoded_data = _convert_tokens_to_text(generated_data, self.tokenizer)
@@ -376,7 +400,8 @@ class GReaT:
                 "The column names in the DataFrame passed to impute do not match the columns of the GReaT model."
             )
 
-        self.model.to(device)
+        #self.model.to(device)
+        self.model.eval()
 
         # start_token = torch.tensor(_pad_tokens(self.tokenizer(starting_prompts)["input_ids"])).to(device)
         index = 0
@@ -401,7 +426,7 @@ class GReaT:
                         df_curr[i_num_cols] = pd.to_numeric(
                             df_curr[i_num_cols], errors="coerce"
                         )
-                    df_curr[self.num_cols] = df_curr[self.num_cols].astype(np.float)
+                    df_curr[self.num_cols] = df_curr[self.num_cols].astype(float)
 
                     # Check for missing values
                     nans = df_curr.isna()
@@ -436,17 +461,28 @@ class GReaT:
             attributes = self.__dict__.copy()
             attributes.pop("tokenizer")
             attributes.pop("model")
+            attributes.pop("trainer")
 
             # NDArray is not JSON serializable and therefore has to be converted into a list.
             if isinstance(attributes["conditional_col_dist"], np.ndarray):
                 attributes["conditional_col_dist"] = list(
                     attributes["conditional_col_dist"]
                 )
+            if isinstance(attributes["quantization_config"], BitsAndBytesConfig):
+                attributes["quantization_config"] = attributes["quantization_config"].to_diff_dict()
+            
+            attributes.pop("lora_config")
+            """
+            if isinstance(attributes["lora_config"], LoraConfig):
+                attributes["lora_config"] = attributes["lora_config"].to_dict()
+                attributes["lora_config"]["target_modules"] = list(attributes["lora_config"]["target_modules"])
+            """
 
             json.dump(attributes, f)
 
         # Save model weights
-        torch.save(self.model.state_dict(), path + "/model.pt")
+        # torch.save(self.model.state_dict(), path + "/model.pt")
+        self.trainer.save_model(path)
 
     def load_finetuned_model(self, path: str):
         """Load fine-tuned model
@@ -483,8 +519,26 @@ class GReaT:
         for k, v in attributes.items():
             setattr(great, k, v)
 
+        if isinstance(attributes["quantization_config"], dict):
+            if "_load_in_4bit" in attributes["quantization_config"].keys():
+                attributes["quantization_config"].pop("_load_in_4bit")
+            if "_load_in_8bit" in attributes["quantization_config"].keys():
+                attributes["quantization_config"].pop("_load_in_8bit")
+            great.quantization_config = BitsAndBytesConfig(**attributes["quantization_config"])
+
         # Load model weights
-        great.model.load_state_dict(torch.load(path + "/model.pt", map_location="cpu"))
+        # great.model.load_state_dict(torch.load(path + "/model.pt", map_location="cpu"))
+
+        ModelClass = AutoPeftModelForCausalLM if great.efficient_finetuning == "lora" else AutoModelForCausalLM
+
+        if great.quantization_config is None:
+            great.model = ModelClass.from_pretrained(path)
+        else:
+            great.model = ModelClass.from_pretrained(
+                path, 
+                quantization_config=great.quantization_config,
+                low_cpu_mem_usage=True
+            )
 
         return great
 

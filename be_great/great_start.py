@@ -3,7 +3,7 @@ import numpy as np
 import typing as tp
 
 
-def _pad(x, length: int, pad_value=50256):
+def _pad(x, length: int, pad_value=2):
     """
     Prepend the pad value until the array reaches the specific length
     """
@@ -11,7 +11,7 @@ def _pad(x, length: int, pad_value=50256):
 
 
 #
-def _pad_tokens(tokens):
+def _pad_tokens(tokens, pad_value=2):
     """
     Checks that all tensors in the list have the same length, pads them if necessary to the max length
 
@@ -22,7 +22,7 @@ def _pad_tokens(tokens):
         List of Tensors, where each Tensor has the same length
     """
     max_length = len(max(tokens, key=len))
-    tokens = [_pad(t, max_length) for t in tokens]
+    tokens = [_pad(t, max_length, pad_value) for t in tokens]
     return tokens
 
 
@@ -90,7 +90,8 @@ class CategoricalStart(GReaTStart):
     def get_start_tokens(self, n_samples):
         start_words = random.choices(self.population, self.weights, k=n_samples)
         start_text = [self.start_col + " is " + str(s) + "," for s in start_words]
-        start_tokens = _pad_tokens(self.tokenizer(start_text)["input_ids"])
+        # start_tokens = _pad_tokens(self.tokenizer(start_text)["input_ids"])
+        start_tokens = self.tokenizer(start_text, padding='longest')["input_ids"]
         return start_tokens
 
 
@@ -140,7 +141,8 @@ class ContinuousStart(GReaTStart):
             self.start_col + " is " + format(s, f".{self.decimal_places}f") + ","
             for s in start_words
         ]
-        start_tokens = _pad_tokens(self.tokenizer(start_text)["input_ids"])
+        #start_tokens = _pad_tokens(self.tokenizer(start_text)["input_ids"])
+        start_tokens = self.tokenizer(start_text, padding='longest')["input_ids"]
         return start_tokens
 
 
@@ -166,5 +168,7 @@ class RandomStart(GReaTStart):
     def get_start_tokens(self, n_samples):
         start_words = random.choices(self.all_columns, k=n_samples)
         start_text = [s + " is " for s in start_words]
-        start_tokens = _pad_tokens(self.tokenizer(start_text)["input_ids"])
+        #start_tokens = _pad_tokens(self.tokenizer(start_text)["input_ids"])
+        start_tokens = self.tokenizer(start_text, padding='longest')["input_ids"]
+        #start_tokens = _pad_tokens(self.tokenizer(start_text)["input_ids"], pad_value=self.tokenizer.pad_token_id)
         return start_tokens
